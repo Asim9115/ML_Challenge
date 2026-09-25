@@ -15,5 +15,8 @@ xgboost>=2.0
 tfidf-matcher>=0.2  
 unidecode>=1.3
 
+# Hyperparameter optimization
+optuna>=3.0
+
 # Progress
 tqdm>=4.65
