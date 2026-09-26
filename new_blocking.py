@@ -1,255 +1,332 @@
 """
-new_blocking.py — Generate candidate pairs using TF-IDF cosine similarity.
+Memory-safe, checkpointed blocking pipeline for the entity resolution task.
+Designed for 12GB RAM Colab.
 
-Run after new_preprocess.py:
-    python new_blocking.py --mode train    # blocking on train data
-    python new_blocking.py --mode test     # blocking on test data
-    python new_blocking.py --mode both     # both
+v3 -- root cause fix + recall tuning, based on real diagnostic results:
+  * CRITICAL FIX: country field is now normalized (strip + lower) before
+    partitioning. Root-cause check found a record with country="US" in
+    source1 and country="US " (trailing space) in source2 -- these were
+    silently routed into DIFFERENT country buckets and could never match,
+    even with jaccard=1.0 identical text. This alone likely explains a large
+    chunk of the 0.40 recall.
+  * RECALL FIX: diagnostic on 15 real missed matches found 15/15 were
+    "cutoff" misses (signal present, just ranked below the old top_k cutoff),
+    0/15 were structural. Avg candidates/row was 46.6 against a hard cap of
+    60 -- real headroom existed. Raised:
+      TOP_K_NGRAM   40  -> 120
+      TOP_K_SNM     20  -> 60
+      SNM_WINDOW    15  -> 50
+    This roughly doubles per-row compute but you have headroom (candidates
+    stage was running at ~10 sec/chunk of 20k rows, well within budget).
+  * All params overridable via CLI without editing the file.
 
-What it does:
-  1. Loads preprocessed S1, S2, S3 files
-  2. Splits by country
-  3. Builds TF-IDF (char n-grams) on S2+S3 combined_text
-  4. For each S1 entity, finds top-K most similar S2+S3 candidates
-  5. Saves candidates to disk as a TSV
+BECAUSE THE COUNTRY-PARTITIONING LOGIC CHANGED, ANY PREVIOUSLY BUILT INDEX
+IS NOW STALE AND MUST BE REBUILT. Wipe blocking_work/ and output/ before
+rerunning stage index, or pass --reset to do it for you.
 
-Output:
-  dataset/preprocessed/train_candidates.tsv
-  dataset/preprocessed/test_candidates.tsv
+RUN
+---
+python blocking_pipeline.py --split train --stage index --reset
+python blocking_pipeline.py --split train --stage candidates
+
+Optional tuning flags (all have the new defaults above if omitted):
+  --top-k-ngram INT
+  --top-k-snm INT
+  --snm-window INT
+  --max-postings INT
 """
 
 import os
-import sys
-import time
+import gc
+import json
+import pickle
+import shutil
 import argparse
-import numpy as np
+from collections import defaultdict, Counter
+
 import pandas as pd
-from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize
-from tqdm import tqdm
+import numpy as np
+
+# --------------------------------------------------------------------------
+# CONFIG (defaults; all overridable via CLI flags below)
+# --------------------------------------------------------------------------
+DATA_DIR = "/content/dataset/preprocessed"
+WORK_DIR = "blocking_work"
+OUT_DIR = "output"
+
+NGRAM_N = 3
+TOP_K_NGRAM_DEFAULT = 120
+TOP_K_SNM_DEFAULT = 60
+SNM_WINDOW_DEFAULT = 50
+MAX_POSTINGS_PER_NGRAM_DEFAULT = 5000
+S1_CHUNK_SIZE = 20_000
+
+os.makedirs(WORK_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+PROGRESS_FILE = os.path.join(WORK_DIR, "progress.json")
 
 
-# ─── Paths ────────────────────────────────────────────────
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "6ab10eb3b23ba_student_resource", "student_resource", "dataset")
-PREP_DIR = os.path.join(DATA_DIR, "preprocessed")
-
-# ─── Config ───────────────────────────────────────────────
-TOP_K = 50                     # candidates per S1 entity
-BATCH_SIZE = 2000              # S1 entities per batch
-TFIDF_MAX_FEATURES = 80000     # vocabulary cap
-TFIDF_NGRAM_RANGE = (2, 4)     # char n-gram range
+# --------------------------------------------------------------------------
+# PROGRESS / CHECKPOINTING
+# --------------------------------------------------------------------------
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE) as f:
+            return json.load(f)
+    return {"index_built": {}, "candidates_done": {}}
 
 
-def load_preprocessed(mode):
-    """Load preprocessed TSVs for train or test."""
-    prefix = "train" if mode == "train" else "test"
-    s1_path = os.path.join(PREP_DIR, f"{prefix}_source1_clean.tsv")
-    s2_path = os.path.join(PREP_DIR, f"{prefix}_source2_clean.tsv")
-    s3_path = os.path.join(PREP_DIR, f"{prefix}_source3_clean.tsv")
-
-    print(f"Loading {prefix} preprocessed data...")
-    t0 = time.time()
-    s1 = pd.read_csv(s1_path, sep="\t", dtype=str, keep_default_na=False)
-    s2 = pd.read_csv(s2_path, sep="\t", dtype=str, keep_default_na=False)
-    s3 = pd.read_csv(s3_path, sep="\t", dtype=str, keep_default_na=False)
-    print(f"  S1: {len(s1):,}, S2: {len(s2):,}, S3: {len(s3):,} — loaded in {time.time()-t0:.1f}s")
-    return s1, s2, s3
+def save_progress(progress):
+    tmp = PROGRESS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(progress, f, indent=2)
+    os.replace(tmp, PROGRESS_FILE)
 
 
-def top_k_from_sparse_row(sparse_row, k):
-    """Get top-k indices and scores from a single sparse matrix row."""
-    data = sparse_row.data
-    indices = sparse_row.indices
-    if len(data) == 0:
-        return np.array([], dtype=int), np.array([], dtype=float)
-    if len(data) <= k:
-        order = np.argsort(-data)
-        return indices[order], data[order]
-    top_k_pos = np.argpartition(data, -k)[-k:]
-    order = np.argsort(-data[top_k_pos])
-    top_k_pos = top_k_pos[order]
-    return indices[top_k_pos], data[top_k_pos]
+# --------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------
+def char_ngrams(s, n=NGRAM_N):
+    if not s:
+        return []
+    if len(s) < n:
+        return [s]
+    return [s[i:i + n] for i in range(len(s) - n + 1)]
 
 
-def block_one_country(s1_country, cand_country, country_name, top_k=TOP_K):
-    """Run TF-IDF blocking for one country partition.
+def sort_key(s):
+    """Token-sorted prefix key: robust to word reordering."""
+    if not s:
+        return ""
+    toks = sorted(s.split())
+    return "".join(toks)[:12]
 
-    Returns dict: {s1_entity_id: [candidate_entity_ids]}
+
+def normalize_country(c):
     """
-    cand_texts = cand_country["combined_text"].tolist()
-    cand_ids = cand_country["entity_id"].tolist()
-    s1_texts = s1_country["combined_text"].tolist()
-    s1_ids = s1_country["entity_id"].tolist()
-
-    if len(cand_texts) == 0:
-        print(f"    No candidates for {country_name} — all singletons")
-        return {eid: [] for eid in s1_ids}
-
-    # Build TF-IDF on candidates
-    print(f"    Building TF-IDF on {len(cand_texts):,} candidates...", end=" ", flush=True)
-    t0 = time.time()
-    vectorizer = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=TFIDF_NGRAM_RANGE,
-        max_features=TFIDF_MAX_FEATURES,
-        sublinear_tf=True,
-        dtype=np.float32,
-    )
-    cand_matrix = vectorizer.fit_transform(cand_texts)
-    cand_matrix = normalize(cand_matrix, norm="l2")
-    print(f"done in {time.time()-t0:.1f}s (vocab: {len(vectorizer.vocabulary_):,})")
-
-    # Query S1 in batches
-    results = {}
-    n_batches = (len(s1_texts) + BATCH_SIZE - 1) // BATCH_SIZE
-
-    for batch_start in tqdm(range(0, len(s1_texts), BATCH_SIZE),
-                            total=n_batches, desc=f"    Querying [{country_name}]"):
-        batch_end = min(batch_start + BATCH_SIZE, len(s1_texts))
-        batch_texts = s1_texts[batch_start:batch_end]
-        batch_ids = s1_ids[batch_start:batch_end]
-
-        # Transform and normalize query batch
-        query_matrix = vectorizer.transform(batch_texts)
-        query_matrix = normalize(query_matrix, norm="l2")
-
-        # Sparse dot product = cosine similarity (both L2-normalized)
-        similarity = query_matrix.dot(cand_matrix.T)
-
-        # Extract top-K per query
-        for i in range(similarity.shape[0]):
-            row = similarity.getrow(i)
-            indices, scores = top_k_from_sparse_row(row, top_k)
-            # Only keep candidates with score > 0
-            mask = scores > 0
-            candidate_list = [cand_ids[idx] for idx in indices[mask]]
-            results[batch_ids[i]] = candidate_list
-
-    return results
+    CRITICAL: strip + lowercase so 'US', 'US ', 'us', ' US' all partition
+    together. Without this, whitespace/case noise in the raw country field
+    silently splits true matches into different, non-comparable buckets --
+    this was the root cause of the 0.40 recall on the real data.
+    """
+    if c is None or (isinstance(c, float) and pd.isna(c)):
+        return ""
+    return str(c).strip().lower()
 
 
-def run_blocking(mode, top_k=TOP_K):
-    """Run full blocking pipeline for train or test."""
-    print(f"\n{'='*60}")
-    print(f"BLOCKING — {mode.upper()}")
-    print(f"{'='*60}")
+def clean_text_cols(chunk):
+    chunk["name_clean"] = chunk["name_clean"].fillna("").astype(str)
+    chunk["addr_clean"] = chunk["addr_clean"].fillna("").astype(str)
+    chunk["country"] = chunk["country"].apply(normalize_country)
+    return chunk
 
-    total_start = time.time()
-    s1, s2, s3 = load_preprocessed(mode)
 
-    # Combine S2 + S3 as candidate pool
-    candidates = pd.concat([s2, s3], ignore_index=True)
-    del s2, s3  # free memory
+def get_countries(split):
+    path = os.path.join(DATA_DIR, f"{split}_source1_clean.tsv")
+    countries = set()
+    for chunk in pd.read_csv(path, sep="\t", usecols=["country"], chunksize=500_000):
+        norm = chunk["country"].apply(normalize_country)
+        countries.update(c for c in norm.unique().tolist() if c)
+    return sorted(countries)
 
-    # Get all countries
-    countries = sorted(s1["country"].unique())
-    print(f"\nCountries found: {countries}")
 
-    all_candidates = {}
+def safe_folder_name(country):
+    return country.replace(" ", "_").replace("/", "_") or "unknown"
+
+
+# --------------------------------------------------------------------------
+# STAGE 1: BUILD INVERTED INDEX (per country, S2+S3 combined)
+# --------------------------------------------------------------------------
+def build_index_for_country(split, country, max_postings):
+    idx_path = os.path.join(WORK_DIR, f"index_{split}_{safe_folder_name(country)}.npz_dir")
+    os.makedirs(idx_path, exist_ok=True)
+
+    int_id = 0
+    id_map = {}
+    inv_index = defaultdict(list)
+    sort_keys = []
+
+    for src in ["source2", "source3"]:
+        path = os.path.join(DATA_DIR, f"{split}_{src}_clean.tsv")
+        cols = ["entity_id", "name_clean", "addr_clean", "country"]
+        for chunk in pd.read_csv(path, sep="\t", usecols=cols, chunksize=200_000):
+            chunk = clean_text_cols(chunk)          # normalize BEFORE filtering
+            chunk = chunk[chunk["country"] == country]
+            if chunk.empty:
+                continue
+
+            for eid, name, addr in chunk[["entity_id", "name_clean", "addr_clean"]].itertuples(index=False):
+                id_map[int_id] = eid
+                text = f"{name} {addr}".strip()
+                grams = set(char_ngrams(text))
+                for g in grams:
+                    inv_index[g].append(int_id)
+                sort_keys.append((sort_key(name), int_id))
+                int_id += 1
+            del chunk
+            gc.collect()
+
+    for g in list(inv_index.keys()):
+        if len(inv_index[g]) > max_postings:
+            del inv_index[g]
+
+    sort_keys.sort(key=lambda t: t[0])
+    sorted_ids = np.array([t[1] for t in sort_keys], dtype=np.int64)
+    sorted_key_strs = np.array([t[0] for t in sort_keys], dtype=object)
+
+    pd.Series(id_map).to_pickle(os.path.join(idx_path, "id_map.pkl"))
+    with open(os.path.join(idx_path, "inv_index.pkl"), "wb") as f:
+        pickle.dump(dict(inv_index), f, protocol=pickle.HIGHEST_PROTOCOL)
+    np.save(os.path.join(idx_path, "sorted_ids.npy"), sorted_ids)
+    np.save(os.path.join(idx_path, "sorted_keys.npy"), sorted_key_strs, allow_pickle=True)
+
+    n_docs = int_id
+    del id_map, inv_index, sort_keys, sorted_ids
+    gc.collect()
+    return idx_path, n_docs
+
+
+def stage_build_index(split, max_postings):
+    progress = load_progress()
+    countries = get_countries(split)
+    print(f"[{split}] normalized countries found: {countries}")
 
     for country in countries:
-        s1_c = s1[s1["country"] == country].reset_index(drop=True)
-        cand_c = candidates[candidates["country"] == country].reset_index(drop=True)
-
-        print(f"\n  [{country}] S1: {len(s1_c):,}, Candidates: {len(cand_c):,}")
-        t0 = time.time()
-
-        country_results = block_one_country(s1_c, cand_c, country, top_k=top_k)
-        all_candidates.update(country_results)
-
-        print(f"    Done in {time.time()-t0:.1f}s")
-
-    # Make sure every S1 entity has an entry
-    for eid in s1["entity_id"]:
-        if eid not in all_candidates:
-            all_candidates[eid] = []
-
-    # Stats
-    total_pairs = sum(len(v) for v in all_candidates.values())
-    non_empty = sum(1 for v in all_candidates.values() if v)
-    avg_cands = total_pairs / len(all_candidates) if all_candidates else 0
-    print(f"\n  Total candidate pairs: {total_pairs:,}")
-    print(f"  S1 with candidates: {non_empty:,} / {len(all_candidates):,}")
-    print(f"  Avg candidates per S1: {avg_cands:.1f}")
-
-    # Save to disk
-    out_path = os.path.join(PREP_DIR, f"{mode}_candidates.tsv")
-    print(f"\n  Saving to {out_path}...")
-    t0 = time.time()
-
-    # Use S1 order from original dataframe
-    s1_ids_ordered = s1["entity_id"].tolist()
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
-        for s1_id in s1_ids_ordered:
-            cands = all_candidates.get(s1_id, [])
-            cand_str = ",".join(cands) if cands else ""
-            f.write(f"{s1_id}\t{cand_str}\n")
-
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(f"  Saved in {time.time()-t0:.1f}s ({size_mb:.1f} MB)")
-
-    # If train mode, check blocking recall against ground truth
-    if mode == "train":
-        gt_path = os.path.join(DATA_DIR, "train", "train_ground_truth.tsv")
-        if os.path.exists(gt_path):
-            check_blocking_recall(all_candidates, gt_path)
-
-    total_time = time.time() - total_start
-    print(f"\n  Blocking ({mode}) complete in {total_time:.1f}s")
-
-
-def check_blocking_recall(candidates, gt_path):
-    """Check what fraction of true matches survived blocking."""
-    print(f"\n  Checking blocking recall against ground truth...")
-    gt = pd.read_csv(gt_path, sep="\t", dtype=str, keep_default_na=False)
-
-    total_true = 0
-    found_true = 0
-    missed_examples = []
-
-    for _, row in gt.iterrows():
-        s1_id = row["source1_entity_id"]
-        matched = row["matched_entity_ids"].strip()
-        if not matched:
+        key = f"{split}::{country}"
+        if progress["index_built"].get(key):
+            print(f"[skip] index already built for {key}")
             continue
-        true_matches = set(matched.split(","))
-        total_true += len(true_matches)
-        cand_set = set(candidates.get(s1_id, []))
-        found = len(true_matches & cand_set)
-        found_true += found
-        if found < len(true_matches) and len(missed_examples) < 5:
-            missed = true_matches - cand_set
-            missed_examples.append((s1_id, missed))
-
-    recall = found_true / total_true if total_true > 0 else 1.0
-    print(f"  Blocking recall: {found_true:,} / {total_true:,} = {recall:.4f}")
-    print(f"  Missed matches: {total_true - found_true:,}")
-
-    if missed_examples:
-        print(f"\n  Sample missed matches:")
-        for s1_id, missed in missed_examples:
-            print(f"    {s1_id} missed: {missed}")
+        print(f"[build] index for {key} ...")
+        idx_path, n_docs = build_index_for_country(split, country, max_postings)
+        progress["index_built"][key] = {"path": idx_path, "n_docs": n_docs}
+        save_progress(progress)
+        print(f"[done] {key}: {n_docs} S2+S3 docs indexed -> {idx_path}")
+        if n_docs == 0:
+            print(f"[WARN] 0 docs indexed for {key} -- check that this country actually "
+                  f"appears in source2/source3 with a matching normalized country value")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="TF-IDF Blocking for Entity Resolution")
-    parser.add_argument("--mode", choices=["train", "test", "both"], default="train",
-                        help="Which data to block (default: train)")
-    parser.add_argument("--top-k", type=int, default=TOP_K,
-                        help=f"Candidates per S1 entity (default: {TOP_K})")
+# --------------------------------------------------------------------------
+# STAGE 2: GENERATE CANDIDATES (per country, chunked over S1)
+# --------------------------------------------------------------------------
+def load_index(idx_path):
+    id_map = pd.read_pickle(os.path.join(idx_path, "id_map.pkl")).to_dict()
+    with open(os.path.join(idx_path, "inv_index.pkl"), "rb") as f:
+        inv_index = pickle.load(f)
+    sorted_ids = np.load(os.path.join(idx_path, "sorted_ids.npy"))
+    sorted_keys = np.load(os.path.join(idx_path, "sorted_keys.npy"), allow_pickle=True)
+    return id_map, inv_index, sorted_ids, sorted_keys
+
+
+def ngram_candidates(text, inv_index, top_k):
+    grams = char_ngrams(text)
+    if not grams:
+        return []
+    counts = Counter()
+    for g in grams:
+        postings = inv_index.get(g)
+        if postings:
+            counts.update(postings)
+    if not counts:
+        return []
+    return [cid for cid, _ in counts.most_common(top_k)]
+
+
+def stage_generate_candidates(split, top_k_ngram, top_k_snm, snm_window):
+    progress = load_progress()
+    countries = get_countries(split)
+    out_path = os.path.join(OUT_DIR, f"candidate_pairs_{split}.tsv")
+
+    if not os.path.exists(out_path):
+        with open(out_path, "w") as f:
+            f.write("source1_entity_id\tcandidate_entity_ids\n")
+
+    for country in countries:
+        idx_key = f"{split}::{country}"
+        if idx_key not in progress["index_built"]:
+            print(f"[warn] no index for {idx_key}, run --stage index first. skipping.")
+            continue
+        idx_path = progress["index_built"][idx_key]["path"]
+        id_map, inv_index, sorted_ids, sorted_keys = load_index(idx_path)
+
+        s1_path = os.path.join(DATA_DIR, f"{split}_source1_clean.tsv")
+        cols = ["entity_id", "name_clean", "addr_clean", "country"]
+
+        chunk_idx = 0
+        for chunk in pd.read_csv(s1_path, sep="\t", usecols=cols, chunksize=S1_CHUNK_SIZE):
+            chunk = clean_text_cols(chunk)           # normalize BEFORE filtering
+            chunk = chunk[chunk["country"] == country]
+            if chunk.empty:
+                chunk_idx += 1
+                continue
+
+            chunk_key = f"{split}::{country}::chunk{chunk_idx}"
+            if progress["candidates_done"].get(chunk_key):
+                chunk_idx += 1
+                continue
+
+            rows_out = []
+            n = len(sorted_ids)
+
+            for eid, name, addr in chunk[["entity_id", "name_clean", "addr_clean"]].itertuples(index=False):
+                text = f"{name} {addr}".strip()
+                ng_cands = ngram_candidates(text, inv_index, top_k_ngram)
+
+                key_str = sort_key(name)
+                pos = int(np.searchsorted(sorted_keys, key_str))
+                lo = max(0, pos - snm_window)
+                hi = min(n, pos + snm_window)
+                snm_cands = sorted_ids[lo:hi].tolist()[:top_k_snm]
+
+                union_ids = set(ng_cands) | set(snm_cands)
+                candidate_eids = [id_map[i] for i in union_ids]
+                rows_out.append((eid, ",".join(candidate_eids)))
+
+            pd.DataFrame(rows_out, columns=["source1_entity_id", "candidate_entity_ids"]) \
+                .to_csv(out_path, sep="\t", mode="a", header=False, index=False)
+
+            progress["candidates_done"][chunk_key] = True
+            save_progress(progress)
+            print(f"[checkpoint] {chunk_key}: {len(rows_out)} S1 rows written")
+
+            del chunk, rows_out
+            gc.collect()
+            chunk_idx += 1
+
+        del id_map, inv_index, sorted_ids, sorted_keys
+        gc.collect()
+
+
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", default="train", choices=["train", "test"])
+    parser.add_argument("--stage", required=True, choices=["index", "candidates"])
+    parser.add_argument("--top-k-ngram", type=int, default=TOP_K_NGRAM_DEFAULT)
+    parser.add_argument("--top-k-snm", type=int, default=TOP_K_SNM_DEFAULT)
+    parser.add_argument("--snm-window", type=int, default=SNM_WINDOW_DEFAULT)
+    parser.add_argument("--max-postings", type=int, default=MAX_POSTINGS_PER_NGRAM_DEFAULT)
+    parser.add_argument("--reset", action="store_true",
+                         help="Wipe blocking_work/ and output/ before running "
+                              "(required once after upgrading to this version, "
+                              "since the country-partitioning fix invalidates "
+                              "any previously built index)")
     args = parser.parse_args()
 
-    top_k = args.top_k
+    if args.reset:
+        if os.path.exists(WORK_DIR):
+            shutil.rmtree(WORK_DIR)
+        if os.path.exists(OUT_DIR):
+            shutil.rmtree(OUT_DIR)
+        os.makedirs(WORK_DIR, exist_ok=True)
+        os.makedirs(OUT_DIR, exist_ok=True)
+        print("[reset] wiped blocking_work/ and output/")
 
-    if args.mode == "both":
-        run_blocking("train", top_k)
-        run_blocking("test", top_k)
+    if args.stage == "index":
+        stage_build_index(args.split, args.max_postings)
     else:
-        run_blocking(args.mode, top_k)
+        stage_generate_candidates(args.split, args.top_k_ngram, args.top_k_snm, args.snm_window)
 
-
-if __name__ == "__main__":
-    main()
+    print("Done. Progress saved to", PROGRESS_FILE)
